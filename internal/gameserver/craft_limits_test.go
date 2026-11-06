@@ -6,12 +6,46 @@ package gameserver
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"rf4server/internal/logging"
 	"rf4server/internal/proto"
 	"rf4server/internal/store"
 )
+
+func TestCraftBatchSpec(t *testing.T) {
+	cases := []struct {
+		name  string
+		def   store.ItemDef
+		limit int64
+		yield int64
+	}{
+		{"窝料60套出60", store.ItemDef{ItemID: "feedcompleted", Category: 46}, 60, 60},
+		{"窝料草鱼60套出60", store.ItemDef{ItemID: "feed_amur", Category: 46}, 60, 60},
+		{"PVA10g 60套出60", store.ItemDef{ItemID: "pva_stick_s", Category: 30}, 60, 60},
+		{"PVA20g 30套出30", store.ItemDef{ItemID: "pva_stick_m", Category: 30}, 30, 30},
+		{"PVA50g 12套出12", store.ItemDef{ItemID: "pva_stick_l", Category: 30}, 12, 12},
+		{"拟饵1套出1", store.ItemDef{ItemID: "hm_crank_65s_hq", Category: 17}, 1, 1},
+		{"引线1套出1", store.ItemDef{ItemID: "leader_sample", Category: 13}, 1, 1},
+		{"PVA网1套出1", store.ItemDef{ItemID: "pvas_b10", Category: 61}, 1, 1},
+		{"奖板1套出1", store.ItemDef{ItemID: "board_sample", Category: 71}, 1, 1},
+		{"茶按物品计件单位", store.ItemDef{ItemID: "thermos_tea", Category: 26}, maxCraftQty, 1},
+		{"面包按物品计件单位", store.ItemDef{ItemID: "bread", Category: 27}, maxCraftQty, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			spec := craftBatchSpecFor(&c.def)
+			if spec.Limit != c.limit || spec.Yield != c.yield {
+				t.Fatalf("craftBatchSpecFor(%s)=%+v, want limit=%d yield=%d",
+					c.def.ItemID, spec, c.limit, c.yield)
+			}
+		})
+	}
+	if spec := craftBatchSpecFor(nil); spec.Limit != 1 || spec.Yield != 1 {
+		t.Fatalf("nil 定义应按 1 套出 1，实得 %+v", spec)
+	}
+}
 
 func TestCraftTimesFor(t *testing.T) {
 	cases := []struct {
@@ -36,40 +70,10 @@ func TestCraftTimesFor(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := craftTimesFor(&c.def, c.qty); got != c.want {
+			if got := craftTimesFor(craftBatchSpecFor(&c.def), c.qty); got != c.want {
 				t.Fatalf("craftTimesFor(%s, %d)=%d, want %d", c.def.ItemID, c.qty, got, c.want)
 			}
 		})
-	}
-	if got := craftBatchLimit(nil); got != 1 {
-		t.Fatalf("nil 定义应按 1 份，实得 %d", got)
-	}
-}
-
-func TestCraftYieldPerSet(t *testing.T) {
-	cases := []struct {
-		name string
-		def  store.ItemDef
-		want int64
-	}{
-		{"窝料一套60", store.ItemDef{ItemID: "feedcompleted", Category: 46}, 60},
-		{"窝料草鱼一套60", store.ItemDef{ItemID: "feed_amur", Category: 46}, 60},
-		{"PVA10g一套60", store.ItemDef{ItemID: "pva_stick_s", Category: 30}, 60},
-		{"PVA20g一套30", store.ItemDef{ItemID: "pva_stick_m", Category: 30}, 30},
-		{"PVA50g一套12", store.ItemDef{ItemID: "pva_stick_l", Category: 30}, 12},
-		{"茶按物品计件单位", store.ItemDef{ItemID: "thermos_tea", Category: 26}, 1},
-		{"面包按物品计件单位", store.ItemDef{ItemID: "bread", Category: 27}, 1},
-		{"拟饵一套1", store.ItemDef{ItemID: "hm_crank_65s_hq", Category: 17}, 1},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := craftYieldPerSet(&c.def); got != c.want {
-				t.Fatalf("craftYieldPerSet(%s)=%d, want %d", c.def.ItemID, got, c.want)
-			}
-		})
-	}
-	if got := craftYieldPerSet(nil); got != 1 {
-		t.Fatalf("nil 定义应按 1 套产出，实得 %d", got)
 	}
 }
 
@@ -317,6 +321,67 @@ func TestCraftBatchCapsAndSlotScaling(t *testing.T) {
 		}
 		if got := countOf(uid, "hvz_pva_string"); got != 4 {
 			t.Fatalf("PVA 线应只扣 1 份，实得剩余 %d", got)
+		}
+	})
+
+	t.Run("跨多个材料堆扣料上报全部GUID", func(t *testing.T) {
+		uid := int64(2200045)
+		box := setup(uid)
+		first := seed(uid, "mix_combi", 1)
+		second := seed(uid, "mix_combi", 1)
+		// 客户端临时 GUID 走类目补扣；2 套需求跨两个各 1 份的材料堆扣完。
+		box.tree = proto.Args524(craftObj8("craft_feed_universal", []craftSlot{{
+			ItemID: "craft_feed_generic_mix_1",
+			GUID:   "00112233445566778899aabbccddeeff",
+		}}, 2))
+		body, ok := box.invoke(t)
+		if !ok {
+			t.Fatal("9/1 未处理")
+		}
+		v := decodeTreeValue(t, srv, body)
+		if !v.IsKind(proto.KindObj) || v.TypeID != 803 || u64Of(v.Fields[0].Num) != 1 {
+			t.Fatalf("制作应成功，实得 %v/%d", v.Kind, v.TypeID)
+		}
+		f8 := v.Fields[8].Val
+		if f8 == nil || f8.Kind != proto.KindGuidArr {
+			t.Fatalf("803.f8 应为 GUID 列表，实得 %+v", f8)
+		}
+		removed := map[string]bool{}
+		for _, it := range f8.Items {
+			removed[it.GuidHex()] = true
+		}
+		if len(removed) != 2 || !removed[first.GUID] || !removed[second.GUID] {
+			t.Fatalf("803.f8 应包含两个耗尽的材料堆 %s/%s，实得 %v",
+				first.GUID, second.GUID, removed)
+		}
+		if got := countOf(uid, "mix_combi"); got != 0 {
+			t.Fatalf("两个材料堆都应耗尽，实得剩余 %d", got)
+		}
+	})
+
+	t.Run("零材料配方限制1份", func(t *testing.T) {
+		uid := int64(2200048)
+		box := setup(uid)
+		for _, c := range []struct{ recipe, output string }{
+			{"craft_crushed_boils", "crushed_boils"},
+			{"craft_bait_cut_fish", "fish_pieces"},
+		} {
+			if !craft(box, c.recipe, nil, 1000) {
+				t.Fatalf("%s 零材料制作应成功", c.recipe)
+			}
+			// 物品定义自带单位量（fish_pieces 每批 30），按事务记录的套数断言批次。
+			var note string
+			if err := db.SQL.QueryRow(
+				`SELECT note FROM txn WHERE uid=? AND kind='craft' ORDER BY id DESC LIMIT 1`, uid).
+				Scan(&note); err != nil {
+				t.Fatalf("%s 流水缺失: %v", c.recipe, err)
+			}
+			if !strings.HasSuffix(note, "qty=1") {
+				t.Fatalf("%s 零材料配方应限制 1 套，流水为 %q", c.recipe, note)
+			}
+			if got := countOf(uid, c.output); got <= 0 || got >= 1000 {
+				t.Fatalf("%s 零材料配方发生批量产出，实得 %d", c.output, got)
+			}
 		}
 	})
 
