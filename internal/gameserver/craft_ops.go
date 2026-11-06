@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -46,8 +47,79 @@ const (
 	obj8FQty       = 5 // ekjiebkgboh 数量
 )
 
-// maxCraftTimes 单次制作的份数上限（防止异常 qty 把材料一次扣光）。
-const maxCraftTimes = 100
+// maxCraftQty 单次制作的份数上限（防止异常 qty 把材料一次扣光）。
+const maxCraftQty = 1_000_000
+
+// craftBatchLimit 返回单次制作允许的最大材料套数。
+// 窝料一套固定出 60 个、PVA 棒按规格 60/30/12 个，受背包单格上限约束；
+// 拟饵/引线/PVA 网/奖板等整件产物一次只能做 1 件；其余按 maxCraftQty。
+func craftBatchLimit(def *store.ItemDef) int64 {
+	if def == nil {
+		return 1
+	}
+	switch def.Category {
+	case 46:
+		return 60
+	case 30:
+		switch def.ItemID {
+		case "pva_stick_m":
+			return 30
+		case "pva_stick_l":
+			return 12
+		}
+		return 60
+	case 13, 15, 17, 61, 71:
+		return 1
+	}
+	return maxCraftQty
+}
+
+// craftYieldPerSet 返回一套材料固定产出的数量。窝料与 PVA 棒的定义数量槽
+// 只有 1（真正数量在配方产出侧），由这里折算；茶/咖啡等由定义自带份数，
+// 这里返回 1。
+func craftYieldPerSet(def *store.ItemDef) int64 {
+	if def == nil {
+		return 1
+	}
+	switch def.Category {
+	case 46:
+		return 60
+	case 30:
+		switch def.ItemID {
+		case "pva_stick_m":
+			return 30
+		case "pva_stick_l":
+			return 12
+		}
+		return 60
+	}
+	return 1
+}
+
+// craftTimesFor 把客户端提交的 qty 收敛到 [1, craftBatchLimit]。
+func craftTimesFor(def *store.ItemDef, qty uint64) int64 {
+	if qty < 1 {
+		return 1
+	}
+	limit := craftBatchLimit(def)
+	if limit < 1 {
+		limit = 1
+	}
+	if qty > uint64(limit) {
+		return limit
+	}
+	return int64(qty)
+}
+
+// craftOutputMerges 决定制作产物是否并入背包已有同种堆。
+// 窝料与 PVA 棒每组材料独立占一格，不与其他批次合并；
+// 其余计件产物（茶、咖啡、面包等）继续按数量堆叠。
+func craftOutputMerges(def *store.ItemDef) bool {
+	if def == nil {
+		return true
+	}
+	return def.Category != 46 && def.Category != 30
+}
 
 // 制作配方对应的技能大类（捕获鱼饵 4 见 baitdig.go）。
 const (
@@ -268,17 +340,22 @@ func allDemandsExplicit(ms []craftDemand) bool {
 }
 
 // scaleDemands 按制作份数放大材料需求；times 为 1 时原样返回。
-func scaleDemands(ms []craftDemand, times int64) []craftDemand {
+// 乘法溢出时返回 ok=false，避免异常份数绕过材料校验。
+func scaleDemands(ms []craftDemand, times int64) ([]craftDemand, bool) {
 	if times <= 1 {
-		return ms
+		return ms, true
 	}
 	out := make([]craftDemand, len(ms))
 	copy(out, ms)
 	for i := range out {
-		q := out[i].need() * times
+		per := out[i].need()
+		if per > 0 && times > math.MaxInt64/per {
+			return nil, false
+		}
+		q := per * times
 		out[i].Qty = &q
 	}
-	return out
+	return out, true
 }
 
 // resolveRecipe 依次按配方 id、产出物 id 和 recipe_ 前缀解析配方键。
@@ -322,16 +399,19 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 	if outputID == "" {
 		outputID = req.Recipe
 	}
-	times := int64(req.Qty)
-	if times < 1 || times > maxCraftTimes {
-		times = 1
+	outputDef, derr := srv.DB.GetItemDefByItemID(cctx, outputID)
+	if derr != nil {
+		ctx.Log.Warn("9/1 产出物定义读取失败", "output", outputID, "err", derr)
+		return srv.replyCraftResult(ctx, false, nil, nil, nil)
 	}
+	times := craftTimesFor(outputDef, req.Qty)
 	uid := ctx.Sess.Userid
 	demands := parseDemands(recipe.MaterialsJSON)
 	isLeaderCraft := strings.HasPrefix(recipe.RecipeID, "craft_leader_")
 
 	// 先在事务外构造物品；构造失败时尚未扣材料。
-	producedRow, err := srv.prepareNewItem(cctx, uid, outputID, "backpack", times, "")
+	producedRow, err := srv.prepareNewItem(cctx, uid, outputID, "backpack",
+		times*craftYieldPerSet(outputDef), "")
 	if err != nil {
 		ctx.Log.Warn("9/1 产出物不可构造", "output", outputID, "err", err)
 		return srv.replyCraftResult(ctx, false, nil, nil, nil)
@@ -366,7 +446,10 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 			return fail("引线材料扣除失败", "err", materialErr)
 		}
 	} else if len(demands) > 0 && allDemandsExplicit(demands) {
-		need := scaleDemands(demands, times)
+		need, ok := scaleDemands(demands, times)
+		if !ok {
+			return fail("材料数量溢出", "times", times)
+		}
 		rows, lerr := listItemsTx(cctx, tx, uid, []string{"backpack", "rig"})
 		if lerr != nil {
 			return fail("读取材料失败", "err", lerr)
@@ -421,18 +504,34 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 			if slot.GUID == "" {
 				continue
 			}
+			// 材料槽按“每套需求 × 制作套数”扣减；槽的 ItemID 是需求 id。
+			demand, hasDemand := byDemand[slot.ItemID]
+			per := int64(1)
+			if hasDemand {
+				per = demand.need()
+				if per < 1 {
+					per = 1
+				}
+			}
+			if per > math.MaxInt64/times {
+				return fail("材料数量溢出", "demand", slot.ItemID, "times", times)
+			}
+			need := per * times
 			consumed := false
 			consumedGUID := ""
 			if row := byGUID[slot.GUID]; row != nil && row.Qty > 0 {
-				if _, cerr := consumeItemQtyTx(cctx, tx, row, 1); cerr != nil {
+				got, cerr := consumeItemQtyTx(cctx, tx, row, need)
+				if cerr != nil {
 					return fail("扣指定材料失败", "guid", slot.GUID, "err", cerr)
+				}
+				if got < need {
+					return fail("材料不足", "item", row.ItemID, "missing", need-got)
 				}
 				consumed = true
 				consumedGUID = row.GUID
 			}
 			if !consumed {
-				demand, ok := byDemand[slot.ItemID]
-				if !ok {
+				if !hasDemand {
 					return fail("材料槽既不在背包也无对应需求", "demand", slot.ItemID, "guid", slot.GUID)
 				}
 				alts := make(map[string]bool)
@@ -445,7 +544,11 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 				for _, c := range demand.Categories {
 					cats[c] = true
 				}
+				remaining := need
 				for _, it := range rows {
+					if remaining <= 0 {
+						break
+					}
 					if it.Qty <= 0 {
 						continue
 					}
@@ -459,16 +562,17 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 					if !match {
 						continue
 					}
-					if _, cerr := consumeItemQtyTx(cctx, tx, it, 1); cerr != nil {
+					got, cerr := consumeItemQtyTx(cctx, tx, it, remaining)
+					if cerr != nil {
 						return fail("按需求扣材料失败", "item", it.ItemID, "err", cerr)
 					}
+					remaining -= got
 					consumed = true
 					consumedGUID = it.GUID
-					break
 				}
-			}
-			if !consumed {
-				return fail("材料槽无法从背包定位", "demand", slot.ItemID, "guid", slot.GUID)
+				if remaining > 0 || !consumed {
+					return fail("材料不足", "demand", demand.DemandID, "missing", remaining)
+				}
 			}
 			if consumedGUID != "" && !containsGUID(touched, consumedGUID) {
 				touched = append(touched, consumedGUID)
@@ -489,9 +593,9 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 	// 引线物化只改子材料与强度，不动数量。
 	producedQty := producedRow.Qty
 
-	// 可计件产物（面包、熟食、饲料等）并入已有同种背包堆，避免每次制作多出一个独立堆；
-	// 拟饵、PVA、引线等非计件产物不受影响，仍插入新实例。
-	row, merged, err := grantPreparedItemTx(cctx, tx, producedRow, true)
+	// 可计件产物（面包、茶、饲料等）并入已有同种背包堆，避免每次制作多出一个独立堆；
+	// 窝料/PVA 棒每组独立占一格；拟饵、引线等非计件产物仍插入新实例。
+	row, merged, err := grantPreparedItemTx(cctx, tx, producedRow, craftOutputMerges(outputDef))
 	if err != nil {
 		return fail("产出物入库失败", "output", outputID, "err", err)
 	}
