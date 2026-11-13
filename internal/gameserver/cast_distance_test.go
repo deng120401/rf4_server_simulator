@@ -165,7 +165,7 @@ func TestCastPlayerStateFactorZeroStateUsesFloor(t *testing.T) {
 func TestCastHighEndGearCanReachFortyFiveMeters(t *testing.T) {
 	d, _ := calculateCastDistance(CastDistanceContext{
 		RigType: 5, CastAction: 1, CastPower: 1,
-		RodLengthM: 4.2, RodAction: 4, RodTestMinG: 5, RodTestMaxG: 30,
+		RodLengthM: 4.2, RodAction: 1, RodTestMinG: 5, RodTestMaxG: 30,
 		PayloadWeightG: 8, ReelEfficiency: 0.95, ReelType: 1,
 		SpoolSize: 1, SpoolFill: 1.0, LineDiameterMM: 0.10,
 		LineStretch: 0.001, LineMaterial: 3,
@@ -174,6 +174,37 @@ func TestCastHighEndGearCanReachFortyFiveMeters(t *testing.T) {
 	})
 	if d < 44.9 {
 		t.Fatalf("高阶装备应能进入45米精准抛投区间，实得%0.2f", d)
+	}
+}
+
+// 官服手竿（竿型 3）无轮抛距 = 竿长 × 2；其余无轮竿与竿长缺失退回旧协议常量。
+func TestHandPoleCastDistanceIsTwiceRodLength(t *testing.T) {
+	srv, _ := newRigTestServer(t)
+	ctx := context.Background()
+	const uid = int64(1000001)
+	cases := []struct {
+		itemID string
+		want   float64
+	}{
+		{"tele_10012_tl13", 7.8},
+		{"tele_10037_t20", 12.0},
+		{"tele_10037_t26", 16.0},
+		{"surv_rod", 8.0},
+		{"rouba_10029_RBS13", float64(castBaseFloatM)},
+		{"spin_10223_PF70MH", float64(castBaseFloatM)},
+	}
+	for _, tc := range cases {
+		rod, err := srv.CreateItem(ctx, uid, tc.itemID, "backpack", 1)
+		if err != nil {
+			t.Fatalf("创建 %s: %v", tc.itemID, err)
+		}
+		p := srv.castDistanceForRig(ctx, uid, rod.GUID, 1)
+		if math.Abs(p.DistanceM-tc.want) > 1e-4 {
+			t.Fatalf("%s 手竿抛距应为 %.2fm，实得 %.4f", tc.itemID, tc.want, p.DistanceM)
+		}
+		if math.Abs(p.BaseM-tc.want) > 1e-4 {
+			t.Fatalf("%s 手竿基准距离应同步为 %.2fm，实得 %.4f", tc.itemID, tc.want, p.BaseM)
+		}
 	}
 }
 
@@ -193,8 +224,8 @@ func TestCastDynamicModifiersAreMonotonic(t *testing.T) {
 	if !(castLineMassFactor(1) > castLineMassFactor(20)) {
 		t.Fatal("更重的运行主线应缩短距离")
 	}
-	if !(castRodActionFactor(4) > castRodActionFactor(3) && castRodActionFactor(3) > castRodActionFactor(1)) {
-		t.Fatal("快调竿梢应小幅提高能量传递")
+	if !(castRodActionFactor(1) > castRodActionFactor(2) && castRodActionFactor(2) > castRodActionFactor(4)) {
+		t.Fatal("慢调竿身蓄力行程更长，应比快调抛得更远")
 	}
 }
 

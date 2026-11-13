@@ -223,19 +223,19 @@ func castLineDiameterFactor(diameterMM float64) float64 {
 }
 
 // castRodActionFactor 按竿的“调性”修正能量传递：慢调竿身整体弯曲、蓄力
-// 行程长但回弹慢，快调竿只有竿梢段参与、回弹干脆，同样挥杆速度下能把更
-// 多能量送给线组。这是客户端调性枚举（1=Slow…4=ExtraFast）在服务端唯一
-// 的物理落点；其余参数（硬度档）见 castRodStiffnessFactor。
+// 行程长，回弹虽慢但能把更多能量送进线组；快调只有竿梢段参与，回弹干脆
+// 却蓄能少。客户端调性枚举 1=Slow…4=ExtraFast，与官服“慢调抛得更远”的
+// 说明保持一致；其余参数（硬度档）见 castRodStiffnessFactor。
 func castRodActionFactor(action int64) float64 {
 	switch action {
 	case 1: // Slow
-		return 0.975
-	case 2: // Moderate
-		return 0.99
-	case 3: // Fast
-		return 1.005
-	case 4: // ExtraFast
 		return 1.02
+	case 2: // Moderate
+		return 1.005
+	case 3: // Fast
+		return 0.99
+	case 4: // ExtraFast
+		return 0.975
 	default:
 		return 1
 	}
@@ -495,7 +495,7 @@ func calculateCastDistance(c CastDistanceContext) (float64, map[string]float64) 
 }
 
 // castDistanceForRig 从真实装配、主线实例、轮子性能和技能表构造抛投上下文，
-// 再经修正器管线计算。没有安装轮子的手竿继续使用旧协议距离。
+// 再经修正器管线计算。没有安装轮子的手竿按官服规则取竿长 × 2。
 func (s *Server) castDistanceForRig(ctx context.Context, uid int64, rodGUID string, rigType int64) castDistanceProfile {
 	legacy := float64(castBaseDistanceM(rigType))
 	p := castDistanceProfile{DistanceM: legacy, BaseM: legacy, Efficiency: 1,
@@ -507,7 +507,26 @@ func (s *Server) castDistanceForRig(ctx context.Context, uid int64, rodGUID stri
 	}
 
 	ids := s.rigGearIDs(ctx, uid, rodGUID)
+	rodType := int64(0)
+	if rod, rerr := s.DB.GetItemByGUID(ctx, rodGUID); rerr == nil && rod != nil {
+		if def, derr := s.itemDefForRow(ctx, rod); derr == nil {
+			if v, ok := defAttrF64(def, "fopbhlmkcpe"); ok {
+				rodType = int64(v)
+			}
+			p.RodLengthM = rodLengthM(def)
+			p.RodAction = rodAction(def)
+			p.RodStiffness = rodStiffness(def)
+			p.RodSensitivity = rodSensitivity(def)
+			p.RodTestMinG, p.RodTestMaxG = rodTestG(def)
+		}
+	}
 	if ids.ReelGUID == "" {
+		// 官服只对手竿（竿型 3）给出抛距 = 竿长 × 2；其余无轮竿与竿长
+		// 缺失的情况保留旧协议常量。
+		if rodType == rodTypeTelescope && p.RodLengthM > 0 {
+			p.DistanceM = 2 * p.RodLengthM
+			p.BaseM = p.DistanceM
+		}
 		return p
 	}
 	reel, err := s.DB.GetItemByGUID(ctx, ids.ReelGUID)
@@ -517,16 +536,6 @@ func (s *Server) castDistanceForRig(ctx context.Context, uid int64, rodGUID stri
 	perf, err := s.syncReelPerformance(ctx, reel)
 	if err != nil || perf == nil {
 		return p
-	}
-
-	if rod, rerr := s.DB.GetItemByGUID(ctx, rodGUID); rerr == nil && rod != nil {
-		if def, derr := s.itemDefForRow(ctx, rod); derr == nil {
-			p.RodLengthM = rodLengthM(def)
-			p.RodAction = rodAction(def)
-			p.RodStiffness = rodStiffness(def)
-			p.RodSensitivity = rodSensitivity(def)
-			p.RodTestMinG, p.RodTestMaxG = rodTestG(def)
-		}
 	}
 
 	line := s.castLineStats(ctx, rodGUID, ids.Line)
